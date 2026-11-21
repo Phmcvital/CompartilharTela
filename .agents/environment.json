@@ -1,0 +1,3 @@
+{
+  "install": "npm --prefix app ci --no-audit --no-fund"
+}

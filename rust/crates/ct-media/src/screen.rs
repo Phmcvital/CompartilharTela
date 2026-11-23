@@ -136,7 +136,9 @@ fn enumerate_macos_monitors() -> Vec<ScreenSource> {
     use screencapturekit::shareable_content::SCShareableContent;
 
     let mut list = Vec::new();
-    if let Ok(content) = SCShareableContent::get() {
+    if crate::has_screen_capture_permission()
+        && let Ok(content) = SCShareableContent::get()
+    {
         for (idx, disp) in content.displays().into_iter().enumerate() {
             let frame = disp.frame();
             let width = (disp.width() as u32).max(640);

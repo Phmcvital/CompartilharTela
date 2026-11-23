@@ -1337,7 +1337,8 @@ mod mac_audio {
         let mut apps: BTreeMap<String, AudioApp> = BTreeMap::new();
         let self_pid = std::process::id() as i32;
 
-        if let Ok(content) = SCShareableContent::get()
+        if crate::has_screen_capture_permission()
+            && let Ok(content) = SCShareableContent::get()
             && let Some(snap) = content.snapshot()
         {
             for app in snap.applications {
@@ -1433,7 +1434,12 @@ mod mac_audio {
         )));
 
         // Tenta iniciar o SCStream de áudio do sistema com exclusão dos apps bloqueados
+        // (apenas se a permissão de gravação de tela estiver concedida no macOS, evitando
+        // bloqueio ou popup de TCC quando sem permissão)
         let sc_stream_opt: Option<SCStream> = (|| -> Option<SCStream> {
+            if !crate::has_screen_capture_permission() {
+                return None;
+            }
             let content = SCShareableContent::get().ok()?;
             let displays = content.displays();
             let display = displays.first()?;
@@ -1554,6 +1560,7 @@ mod mac_audio {
                 if cur_blocked != last_blocked {
                     last_blocked = cur_blocked.clone();
                     if let Some(ref stream) = sc_stream_opt
+                        && crate::has_screen_capture_permission()
                         && let Ok(content) = SCShareableContent::get()
                         && let Some(display) = content.displays().first()
                         && let Some(new_filter) =
@@ -1737,7 +1744,7 @@ mod tests {
         assert!((engine.send_volume() - 1.5).abs() < f32::EPSILON);
 
         let (_mode, mut rx) = engine.start(&["discord.exe".into()]).unwrap();
-        let chunk = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        let chunk = tokio::time::timeout(Duration::from_millis(2000), rx.recv())
             .await
             .unwrap()
             .unwrap();

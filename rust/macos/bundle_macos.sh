@@ -42,6 +42,11 @@ if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
     rm -rf "$ICONSET_DIR"
 fi
 
+# Garante que /usr/lib/swift esteja no rpath do binário (para libswift_Concurrency.dylib do ScreenCaptureKit)
+if command -v install_name_tool >/dev/null 2>&1; then
+    install_name_tool -add_rpath /usr/lib/swift "$APP_DIR/Contents/MacOS/compartilhador-de-tela" 2>/dev/null || true
+fi
+
 # Assinatura ad-hoc para que o macOS Gatekeeper e o TCC (ScreenCaptureKit) identifiquem o bundle de forma consistente
 if command -v codesign >/dev/null 2>&1; then
     codesign --force --deep --sign - "$APP_DIR"

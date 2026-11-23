@@ -75,6 +75,34 @@ pub fn render_share_dialog(app: &mut CompartilharApp, ctx: &Context) {
                 );
             });
 
+            // Aviso amigável no macOS caso a Permissão de Gravação de Tela ainda não tenha sido concedida
+            if !ct_media::has_screen_capture_permission() {
+                ui.add_space(6.0);
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_rgb(56, 42, 16))
+                    .stroke(Stroke::new(1.0_f32, super::theme::ACCENT_WARN))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Permissão necessária no macOS: habilite o PIT em Ajustes do Sistema > Privacidade e Segurança > Gravação de Tela.",
+                                )
+                                .size(11.5)
+                                .color(egui::Color32::from_rgb(255, 232, 175)),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("Solicitar permissão").clicked() {
+                                    let _ = ct_media::request_screen_capture_permission();
+                                    app.screen_sources = app.session.list_screen_sources();
+                                    app.refresh_audio_apps_async(ctx);
+                                }
+                            });
+                        });
+                    });
+            }
+
             ui.add_space(8.0);
 
             // Linha 2 dedicada: Banner Recomendado em largura total

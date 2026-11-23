@@ -48,3 +48,33 @@ pub fn is_elevated() -> bool {
 pub fn is_elevated() -> bool {
     false
 }
+
+/// Verifica se o processo possui permissão de Gravação de Tela no macOS.
+/// No Windows/Linux sempre retorna `true`.
+#[cfg(target_os = "macos")]
+pub fn has_screen_capture_permission() -> bool {
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+    }
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn has_screen_capture_permission() -> bool {
+    true
+}
+
+/// Abre o prompt oficial do macOS solicitando permissão de Gravação de Tela.
+#[cfg(target_os = "macos")]
+pub fn request_screen_capture_permission() -> bool {
+    unsafe extern "C" {
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+    unsafe { CGRequestScreenCaptureAccess() }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn request_screen_capture_permission() -> bool {
+    true
+}
+

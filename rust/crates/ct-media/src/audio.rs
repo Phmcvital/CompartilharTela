@@ -129,7 +129,11 @@ impl AudioCaptureEngine {
                         win_audio::run_system_loopback_loop(running, vol_bits, tx);
                     }
                 }
-                #[cfg(not(windows))]
+                #[cfg(target_os = "macos")]
+                {
+                    mac_audio::run_macos_capture_loop(running, vol_bits, blocked_ref, tx);
+                }
+                #[cfg(not(any(windows, target_os = "macos")))]
                 {
                     let _ = blocked_ref;
                     run_dummy_capture_loop(running, vol_bits, tx);
@@ -157,7 +161,7 @@ impl Drop for AudioCaptureEngine {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn run_dummy_capture_loop(
     running: Arc<AtomicBool>,
     send_volume_bits: Arc<AtomicU32>,
@@ -173,7 +177,7 @@ fn run_dummy_capture_loop(
 }
 
 // ============================================================================
-// Reprodução de Áudio Remoto (Mixer Multi-Stream WASAPI)
+// Reprodução de Áudio Remoto (Mixer Multi-Stream WASAPI / CoreAudio)
 // ============================================================================
 
 /// 60 ms de buffer de jitter antes de iniciar reprodução (elimina engasgos de rede).
@@ -191,7 +195,7 @@ struct PlaybackShared {
     peers: StdMutex<HashMap<String, PeerAudioQueue>>,
 }
 
-/// Reproduz áudio recebido de todos os participantes remotos via WASAPI `IAudioRenderClient`,
+/// Reproduz áudio recebido de todos os participantes remotos via WASAPI / CoreAudio,
 /// com jitter buffer pré-carregado (60 ms) e volume individual por participante (0%–200%).
 pub struct AudioPlaybackMixer {
     running: Arc<AtomicBool>,
@@ -223,7 +227,18 @@ impl AudioPlaybackMixer {
                 })
                 .ok()
         };
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        let worker = {
+            let run_flag = running.clone();
+            let sh = shared.clone();
+            thread::Builder::new()
+                .name("ct-audio-playback".to_string())
+                .spawn(move || {
+                    mac_audio::run_playback_loop_macos(run_flag, sh);
+                })
+                .ok()
+        };
+        #[cfg(not(any(windows, target_os = "macos")))]
         let worker = None;
 
         Self {
@@ -288,7 +303,7 @@ impl Drop for AudioPlaybackMixer {
 // Enumeração de Apps com Áudio
 // ============================================================================
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn enumerate_audio_apps(blocked: &HashSet<String>) -> Vec<AudioApp> {
     blocked
         .iter()
@@ -304,6 +319,11 @@ fn enumerate_audio_apps(blocked: &HashSet<String>) -> Vec<AudioApp> {
 #[cfg(windows)]
 fn enumerate_audio_apps(blocked: &HashSet<String>) -> Vec<AudioApp> {
     win_audio::enumerate_audio_apps_win(blocked)
+}
+
+#[cfg(target_os = "macos")]
+fn enumerate_audio_apps(blocked: &HashSet<String>) -> Vec<AudioApp> {
+    mac_audio::enumerate_audio_apps_mac(blocked)
 }
 
 // ============================================================================
@@ -1246,6 +1266,463 @@ mod win_audio {
                 CoUninitialize();
             }
         }
+    }
+}
+
+// ============================================================================
+// Implementação macOS (ScreenCaptureKit Audio + Exclusão de Apps + CoreAudio/cpal)
+// ============================================================================
+
+#[cfg(target_os = "macos")]
+mod mac_audio {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::{FromSample, Sample, SampleFormat, SizedSample, StreamConfig};
+    use screencapturekit::prelude::*;
+    use screencapturekit::shareable_content::{SCRunningApplication, SCShareableContent};
+
+    const MAC_SYSTEM_BUNDLE_PREFIXES: &[&str] = &[
+        "com.apple.controlcenter",
+        "com.apple.dock",
+        "com.apple.finder",
+        "com.apple.loginwindow",
+        "com.apple.notificationcenterui",
+        "com.apple.Spotlight",
+        "com.apple.SystemUIServer",
+        "com.apple.WindowManager",
+        "com.apple.Wallpaper",
+    ];
+
+    fn is_mac_system_noise(bundle_id: &str, app_name: &str) -> bool {
+        if app_name.trim().is_empty() {
+            return true;
+        }
+        let lower_name = app_name.to_ascii_lowercase();
+        if lower_name == "pit" || lower_name == "compartilhador-de-tela" {
+            return true;
+        }
+        let lower_bundle = bundle_id.to_ascii_lowercase();
+        MAC_SYSTEM_BUNDLE_PREFIXES
+            .iter()
+            .any(|p| lower_bundle.starts_with(&p.to_ascii_lowercase()))
+    }
+
+    /// Verifica se um `SCRunningApplication` corresponde a algum item de `blocked`.
+    /// Suporta tanto bundle IDs (`com.hnc.Discord`) quanto nomes (`discord` ou `discord.exe`).
+    fn is_mac_app_blocked(bundle_id: &str, app_name: &str, blocked: &HashSet<String>) -> bool {
+        let b_low = bundle_id.trim().to_ascii_lowercase();
+        let n_low = app_name.trim().to_ascii_lowercase();
+        let n_exe = format!("{n_low}.exe");
+
+        if !b_low.is_empty() && blocked.contains(&b_low) {
+            return true;
+        }
+        if !n_low.is_empty() && (blocked.contains(&n_low) || blocked.contains(&n_exe)) {
+            return true;
+        }
+        // Também casa o último segmento do bundle ID (ex: com.hnc.Discord -> discord / discord.exe)
+        if let Some(last_seg) = b_low.rsplit('.').next()
+            && !last_seg.is_empty()
+            && (blocked.contains(last_seg) || blocked.contains(&format!("{last_seg}.exe")))
+        {
+            return true;
+        }
+        false
+    }
+
+    pub fn enumerate_audio_apps_mac(blocked: &HashSet<String>) -> Vec<AudioApp> {
+        let mut apps: BTreeMap<String, AudioApp> = BTreeMap::new();
+        let self_pid = std::process::id() as i32;
+
+        if let Ok(content) = SCShareableContent::get()
+            && let Some(snap) = content.snapshot()
+        {
+            for app in snap.applications {
+                if app.process_id == self_pid {
+                    continue;
+                }
+                if is_mac_system_noise(&app.bundle_identifier, &app.application_name) {
+                    continue;
+                }
+                let key = if app.bundle_identifier.trim().is_empty() {
+                    app.application_name.trim().to_ascii_lowercase()
+                } else {
+                    app.bundle_identifier.trim().to_ascii_lowercase()
+                };
+                if key.is_empty() {
+                    continue;
+                }
+                let is_blocked =
+                    is_mac_app_blocked(&app.bundle_identifier, &app.application_name, blocked);
+                let entry = apps.entry(key.clone()).or_insert(AudioApp {
+                    exe: key,
+                    name: app.application_name.trim().to_string(),
+                    active: false,
+                    blocked: is_blocked,
+                });
+                entry.blocked = entry.blocked || is_blocked;
+            }
+        }
+
+        // Inclui também itens já salvos na lista de bloqueados que ainda não apareceram
+        for b_item in blocked {
+            let clean = b_item.trim().to_ascii_lowercase();
+            if clean.is_empty() {
+                continue;
+            }
+            let already_covered = apps
+                .values()
+                .any(|a| is_mac_app_blocked(&a.exe, &a.name, &HashSet::from([clean.clone()])));
+            if !already_covered {
+                let display = clean.strip_suffix(".exe").unwrap_or(&clean).to_string();
+                apps.entry(clean.clone()).or_insert(AudioApp {
+                    exe: clean,
+                    name: display,
+                    active: false,
+                    blocked: true,
+                });
+            }
+        }
+
+        let mut list: Vec<AudioApp> = apps.into_values().collect();
+        list.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+        list
+    }
+
+    fn build_mac_audio_filter(
+        content: &SCShareableContent,
+        display: &screencapturekit::shareable_content::SCDisplay,
+        blocked: &HashSet<String>,
+    ) -> Option<SCContentFilter> {
+        let all_apps = content.applications();
+        let excluded: Vec<&SCRunningApplication> = all_apps
+            .iter()
+            .filter(|app| {
+                let bundle = app.bundle_identifier();
+                let name = app.application_name();
+                is_mac_app_blocked(&bundle, &name, blocked)
+            })
+            .collect();
+
+        if excluded.is_empty() {
+            SCContentFilter::create()
+                .with_display(display)
+                .with_excluding_windows(&[])
+                .build()
+                .ok()
+        } else {
+            SCContentFilter::create()
+                .with_display(display)
+                .with_excluding_applications(&excluded, &[])
+                .build()
+                .ok()
+        }
+    }
+
+    pub fn run_macos_capture_loop(
+        running: Arc<AtomicBool>,
+        send_volume_bits: Arc<AtomicU32>,
+        blocked: Arc<(StdMutex<HashSet<String>>, Condvar)>,
+        tx: mpsc::Sender<Vec<f32>>,
+    ) {
+        let ring: Arc<StdMutex<VecDeque<f32>>> = Arc::new(StdMutex::new(VecDeque::with_capacity(
+            AUDIO_SAMPLE_RATE as usize * AUDIO_CHANNELS / 2,
+        )));
+
+        // Tenta iniciar o SCStream de áudio do sistema com exclusão dos apps bloqueados
+        let mut sc_stream_opt: Option<SCStream> = (|| -> Option<SCStream> {
+            let content = SCShareableContent::get().ok()?;
+            let displays = content.displays();
+            let display = displays.first()?;
+
+            let initial_blocked = {
+                let (lock, _) = &*blocked;
+                lock.lock().map(|g| g.clone()).unwrap_or_default()
+            };
+
+            let filter = build_mac_audio_filter(&content, display, &initial_blocked)?;
+
+            // Vídeo mínimo (64x64 @ 1 fps) apenas para alimentar o pipeline de áudio do SCStream
+            let config = SCStreamConfiguration::new()
+                .with_width(64)
+                .with_height(64)
+                .with_fps(1)
+                .with_captures_audio(true)
+                .with_excludes_current_process_audio(true)
+                .with_sample_rate(AUDIO_SAMPLE_RATE as i32)
+                .with_channel_count(AUDIO_CHANNELS as i32);
+
+            struct MacAudioHandler {
+                ring: Arc<StdMutex<VecDeque<f32>>>,
+            }
+
+            impl SCStreamOutputTrait for MacAudioHandler {
+                fn did_output_sample_buffer(
+                    &self,
+                    sample: CMSampleBuffer,
+                    of_type: SCStreamOutputType,
+                ) {
+                    if !matches!(of_type, SCStreamOutputType::Audio) {
+                        return;
+                    }
+                    let Ok(abl) = sample.audio_buffer_list() else {
+                        return;
+                    };
+                    let num_bufs = abl.num_buffers();
+                    if num_bufs == 0 {
+                        return;
+                    }
+
+                    if let Ok(mut q) = self.ring.lock() {
+                        if num_bufs >= 2 {
+                            // Planar f32: buffer 0 = Left, buffer 1 = Right
+                            let b0 = abl.get(0).map(|b| b.data()).unwrap_or(&[]);
+                            let b1 = abl.get(1).map(|b| b.data()).unwrap_or(b0);
+                            let frames = (b0.len() / 4).min(b1.len() / 4);
+                            for i in 0..frames {
+                                let l = f32::from_le_bytes(
+                                    b0[i * 4..i * 4 + 4].try_into().unwrap_or([0; 4]),
+                                );
+                                let r = f32::from_le_bytes(
+                                    b1[i * 4..i * 4 + 4].try_into().unwrap_or([0; 4]),
+                                );
+                                q.push_back(l);
+                                q.push_back(r);
+                            }
+                        } else if let Some(b0) = abl.get(0) {
+                            let data = b0.data();
+                            if b0.number_channels >= 2 {
+                                // Intercalado estéreo f32
+                                for chunk in data.chunks_exact(4) {
+                                    let s =
+                                        f32::from_le_bytes(chunk.try_into().unwrap_or([0; 4]));
+                                    q.push_back(s);
+                                }
+                            } else {
+                                // Mono -> duplica L/R
+                                for chunk in data.chunks_exact(4) {
+                                    let s =
+                                        f32::from_le_bytes(chunk.try_into().unwrap_or([0; 4]));
+                                    q.push_back(s);
+                                    q.push_back(s);
+                                }
+                            }
+                        }
+
+                        let max_q = (AUDIO_SAMPLE_RATE as usize / 4) * AUDIO_CHANNELS;
+                        if q.len() > max_q {
+                            let drop_n = q.len() - (AUDIO_CHUNK_SAMPLES * 2);
+                            q.drain(..drop_n);
+                        }
+                    }
+                }
+            }
+
+            let mut stream = SCStream::new(&filter, &config).ok()?;
+            stream
+                .add_output_handler(
+                    MacAudioHandler {
+                        ring: ring.clone(),
+                    },
+                    SCStreamOutputType::Audio,
+                )
+                .ok()?;
+            stream.start_capture().ok()?;
+            Some(stream)
+        })();
+
+        let mut last_blocked = {
+            let (lock, _) = &*blocked;
+            lock.lock().map(|g| g.clone()).unwrap_or_default()
+        };
+        let mut last_filter_check = Instant::now();
+
+        let start = Instant::now();
+        let mut produced_chunks: u64 = 0;
+
+        while running.load(Ordering::Relaxed) {
+            // Verifica se a lista de apps bloqueados mudou ao vivo para atualizar o filtro do SCStream
+            if last_filter_check.elapsed() >= Duration::from_millis(400) {
+                last_filter_check = Instant::now();
+                let cur_blocked = {
+                    let (lock, _) = &*blocked;
+                    lock.lock().map(|g| g.clone()).unwrap_or_default()
+                };
+                if cur_blocked != last_blocked {
+                    last_blocked = cur_blocked.clone();
+                    if let Some(ref stream) = sc_stream_opt
+                        && let Ok(content) = SCShareableContent::get()
+                        && let Some(display) = content.displays().first()
+                        && let Some(new_filter) =
+                            build_mac_audio_filter(&content, display, &cur_blocked)
+                    {
+                        let _ = stream.update_content_filter(&new_filter);
+                    }
+                }
+            }
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let due_chunks = elapsed_ms / 20;
+            if due_chunks > produced_chunks + 10 {
+                produced_chunks = due_chunks.saturating_sub(1);
+            }
+            while produced_chunks < due_chunks && running.load(Ordering::Relaxed) {
+                let mut mix = vec![0.0f32; AUDIO_CHUNK_SAMPLES];
+                if let Ok(mut q) = ring.lock() {
+                    let take = mix.len().min(q.len());
+                    for slot in mix.iter_mut().take(take) {
+                        if let Some(v) = q.pop_front() {
+                            *slot = v;
+                        }
+                    }
+                }
+                let gain = f32::from_bits(send_volume_bits.load(Ordering::Relaxed));
+                apply_gain_slice(&mut mix, gain);
+                let _ = tx.try_send(mix);
+                produced_chunks += 1;
+            }
+            thread::sleep(Duration::from_millis(4));
+        }
+
+        if let Some(stream) = sc_stream_opt {
+            let _ = stream.stop_capture();
+        }
+    }
+
+    pub fn run_playback_loop_macos(running: Arc<AtomicBool>, shared: Arc<PlaybackShared>) {
+        let host = cpal::default_host();
+        let Some(device) = host.default_output_device() else {
+            tracing::warn!("Nenhum dispositivo de saída de áudio encontrado no macOS");
+            return;
+        };
+        let Ok(default_cfg) = device.default_output_config() else {
+            tracing::warn!("Falha ao obter configuração padrão de saída CoreAudio");
+            return;
+        };
+
+        let sample_format = default_cfg.sample_format();
+        let channels = default_cfg.channels() as usize;
+        let out_rate = default_cfg.sample_rate();
+        let config: StreamConfig = default_cfg.into();
+
+        let stream_res = match sample_format {
+            SampleFormat::F32 => {
+                build_cpal_output_stream::<f32>(&device, &config, channels, out_rate, shared)
+            }
+            SampleFormat::I16 => {
+                build_cpal_output_stream::<i16>(&device, &config, channels, out_rate, shared)
+            }
+            SampleFormat::U16 => {
+                build_cpal_output_stream::<u16>(&device, &config, channels, out_rate, shared)
+            }
+            _ => {
+                tracing::warn!("Formato de saída CoreAudio não suportado: {sample_format:?}");
+                return;
+            }
+        };
+
+        let Ok(stream) = stream_res else {
+            tracing::warn!("Falha ao abrir stream de reprodução CoreAudio no macOS");
+            return;
+        };
+        if stream.play().is_err() {
+            tracing::warn!("Falha ao iniciar stream de reprodução CoreAudio no macOS");
+            return;
+        }
+
+        while running.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn build_cpal_output_stream<T>(
+        device: &cpal::Device,
+        config: &StreamConfig,
+        out_channels: usize,
+        out_rate: u32,
+        shared: Arc<PlaybackShared>,
+    ) -> Result<cpal::Stream, cpal::BuildStreamError>
+    where
+        T: SizedSample + FromSample<f32>,
+    {
+        let out_ch = out_channels.max(1);
+        let ratio = (AUDIO_SAMPLE_RATE as f64) / (out_rate.max(8000) as f64);
+        let mut frac_pos: f64 = 0.0;
+        let mut cur_lr = [0.0f32; 2];
+        let mut next_lr = [0.0f32; 2];
+
+        let pop_stereo_frame = |sh: &PlaybackShared| -> [f32; 2] {
+            let mut l_sum = 0.0f32;
+            let mut r_sum = 0.0f32;
+            if let Ok(mut map) = sh.peers.lock() {
+                for peer in map.values_mut() {
+                    if !peer.primed {
+                        continue;
+                    }
+                    if peer.samples.len() < 2 {
+                        peer.samples.clear();
+                        peer.primed = false;
+                        continue;
+                    }
+                    let l = peer.samples.pop_front().unwrap_or(0.0);
+                    let r = peer.samples.pop_front().unwrap_or(l);
+                    l_sum += l * peer.volume;
+                    r_sum += r * peer.volume;
+                }
+            }
+            [l_sum.clamp(-1.0, 1.0), r_sum.clamp(-1.0, 1.0)]
+        };
+
+        device.build_output_stream(
+            config,
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                if (out_rate as i64 - AUDIO_SAMPLE_RATE as i64).abs() <= 1 {
+                    // Taxa nativa de 48 kHz: cópia direta sem reamostragem
+                    for frame in data.chunks_mut(out_ch) {
+                        let [l, r] = pop_stereo_frame(&shared);
+                        if out_ch == 1 {
+                            frame[0] = T::from_sample((l + r) * 0.5);
+                        } else {
+                            frame[0] = T::from_sample(l);
+                            frame[1] = T::from_sample(r);
+                            for extra in frame.iter_mut().skip(2) {
+                                *extra = T::from_sample(0.0);
+                            }
+                        }
+                    }
+                } else {
+                    // Reamostragem linear suave caso o dispositivo esteja em 44.1 kHz / 96 kHz
+                    for frame in data.chunks_mut(out_ch) {
+                        while frac_pos >= 1.0 {
+                            cur_lr = next_lr;
+                            next_lr = pop_stereo_frame(&shared);
+                            frac_pos -= 1.0;
+                        }
+                        let t = frac_pos as f32;
+                        let l = cur_lr[0] + (next_lr[0] - cur_lr[0]) * t;
+                        let r = cur_lr[1] + (next_lr[1] - cur_lr[1]) * t;
+                        frac_pos += ratio;
+
+                        if out_ch == 1 {
+                            frame[0] = T::from_sample((l + r) * 0.5);
+                        } else {
+                            frame[0] = T::from_sample(l);
+                            frame[1] = T::from_sample(r);
+                            for extra in frame.iter_mut().skip(2) {
+                                *extra = T::from_sample(0.0);
+                            }
+                        }
+                    }
+                }
+            },
+            |err| {
+                tracing::warn!("Erro no stream CoreAudio: {err}");
+            },
+            None,
+        )
     }
 }
 

@@ -113,7 +113,11 @@ pub fn list_screen_sources() -> Vec<ScreenSource> {
     {
         enumerate_windows_monitors()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        enumerate_macos_monitors()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         vec![ScreenSource {
             id: "screen:0".to_string(),
@@ -125,6 +129,41 @@ pub fn list_screen_sources() -> Vec<ScreenSource> {
             monitor_index: 0,
         }]
     }
+}
+
+#[cfg(target_os = "macos")]
+fn enumerate_macos_monitors() -> Vec<ScreenSource> {
+    use screencapturekit::shareable_content::SCShareableContent;
+
+    let mut list = Vec::new();
+    if let Ok(content) = SCShareableContent::get() {
+        for (idx, disp) in content.displays().into_iter().enumerate() {
+            let frame = disp.frame();
+            let width = (disp.width() as u32).max(640);
+            let height = (disp.height() as u32).max(360);
+            list.push(ScreenSource {
+                id: format!("screen:{idx}"),
+                name: format!("Tela {} ({}x{})", idx + 1, width, height),
+                left: frame.origin.x.round() as i32,
+                top: frame.origin.y.round() as i32,
+                width,
+                height,
+                monitor_index: idx,
+            });
+        }
+    }
+    if list.is_empty() {
+        list.push(ScreenSource {
+            id: "screen:0".to_string(),
+            name: "Tela Principal (Mac)".to_string(),
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+            monitor_index: 0,
+        });
+    }
+    list
 }
 
 #[cfg(windows)]
@@ -229,7 +268,12 @@ impl ScreenCapturer {
                 {
                     capture_loop_windows(source, cfg_ref, gpu_adapter_index, run_flag, tx);
                 }
-                #[cfg(not(windows))]
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = gpu_adapter_index;
+                    capture_loop_macos(source, cfg_ref, run_flag, tx);
+                }
+                #[cfg(not(any(windows, target_os = "macos")))]
                 {
                     let _ = gpu_adapter_index;
                     capture_loop_fallback(cfg_ref, run_flag, tx);
@@ -282,7 +326,7 @@ fn fit_dimensions(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) 
     (w, h)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn convert_bgra_to_rgba_scaled(
     src: &[u8],
     src_pitch: usize,
@@ -691,7 +735,203 @@ fn capture_loop_gdi(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn capture_loop_macos(
+    source: ScreenSource,
+    config: Arc<RwLock<LiveCaptureConfig>>,
+    running: Arc<AtomicBool>,
+    tx: watch::Sender<Option<CapturedVideoFrame>>,
+) {
+    use screencapturekit::cm::CMSampleBufferExt;
+    use screencapturekit::cv::{CVPixelBufferLockFlags, PixelBufferCursorExt};
+    use screencapturekit::prelude::*;
+    use std::sync::Mutex as StdMutex;
+
+    let Ok(content) = SCShareableContent::get() else {
+        tracing::warn!(
+            "Sem permissão de Gravação de Tela no macOS (Ajustes do Sistema > Privacidade e Segurança > Gravação de Tela)"
+        );
+        return;
+    };
+
+    let displays = content.displays();
+    let Some(display) = displays
+        .get(source.monitor_index)
+        .or_else(|| displays.first())
+    else {
+        tracing::warn!("Nenhum monitor SCDisplay encontrado no macOS");
+        return;
+    };
+
+    let src_w = (display.width() as u32).max(640);
+    let src_h = (display.height() as u32).max(360);
+
+    let Ok(filter) = SCContentFilter::create()
+        .with_display(display)
+        .with_excluding_windows(&[])
+        .build()
+    else {
+        tracing::warn!("Falha ao criar SCContentFilter para o monitor");
+        return;
+    };
+
+    let mut applied_cfg = *config.read().unwrap();
+    let (init_w, init_h) = fit_dimensions(src_w, src_h, applied_cfg.max_width, applied_cfg.max_height);
+
+    let sc_cfg = SCStreamConfiguration::new()
+        .with_width(init_w as usize)
+        .with_height(init_h as usize)
+        .with_fps(applied_cfg.fps.max(5))
+        .with_pixel_format(PixelFormat::BGRA)
+        .with_shows_cursor(true)
+        .with_queue_depth(4);
+
+    let Ok(mut stream) = SCStream::new(&filter, &sc_cfg) else {
+        tracing::warn!("Falha ao inicializar SCStream de vídeo no macOS");
+        return;
+    };
+
+    // Guarda o último frame RGBA capturado para reemitir imediatamente se a resolução mudar em tela estática
+    let last_frame_cache: Arc<StdMutex<Option<(u32, u32, Vec<u8>)>>> =
+        Arc::new(StdMutex::new(None));
+    let cache_for_cb = last_frame_cache.clone();
+    let cfg_for_cb = config.clone();
+    let tx_for_cb = tx.clone();
+
+    struct MacVideoHandler {
+        cfg: Arc<RwLock<LiveCaptureConfig>>,
+        tx: watch::Sender<Option<CapturedVideoFrame>>,
+        cache: Arc<StdMutex<Option<(u32, u32, Vec<u8>)>>>,
+        src_w: u32,
+        src_h: u32,
+    }
+
+    impl SCStreamOutputTrait for MacVideoHandler {
+        fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
+            if !matches!(of_type, SCStreamOutputType::Screen) {
+                return;
+            }
+            let Some(pixel_buffer) = sample.pixel_buffer() else {
+                return;
+            };
+            let Ok(guard) = pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) else {
+                return;
+            };
+            let buf_w = guard.width() as u32;
+            let buf_h = guard.height() as u32;
+            let pitch = guard.bytes_per_row();
+            if buf_w == 0 || buf_h == 0 || pitch < (buf_w as usize) * 4 {
+                return;
+            }
+            let Some(slice) = (unsafe { guard.as_slice() }) else {
+                return;
+            };
+            let needed = pitch
+                .saturating_mul(buf_h.saturating_sub(1) as usize)
+                .saturating_add((buf_w as usize) * 4);
+            if slice.len() < needed {
+                return;
+            }
+
+            let cur_cfg = *self.cfg.read().unwrap();
+            let (dst_w, dst_h) =
+                fit_dimensions(self.src_w, self.src_h, cur_cfg.max_width, cur_cfg.max_height);
+            let rgba = convert_bgra_to_rgba_scaled(slice, pitch, buf_w, buf_h, dst_w, dst_h);
+
+            if let Ok(mut c) = self.cache.lock() {
+                *c = Some((dst_w, dst_h, rgba.clone()));
+            }
+
+            let _ = self.tx.send(Some(CapturedVideoFrame {
+                width: dst_w,
+                height: dst_h,
+                rgba: Arc::new(rgba),
+                seq: next_seq(),
+            }));
+        }
+    }
+
+    let handler = MacVideoHandler {
+        cfg: cfg_for_cb,
+        tx: tx_for_cb,
+        cache: cache_for_cb,
+        src_w,
+        src_h,
+    };
+
+    if stream
+        .add_output_handler(handler, SCStreamOutputType::Screen)
+        .is_err()
+    {
+        tracing::warn!("Falha ao registrar handler de vídeo no SCStream");
+        return;
+    }
+
+    if stream.start_capture().is_err() {
+        tracing::warn!("Falha ao iniciar captura SCStream no macOS");
+        return;
+    }
+
+    while running.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(80));
+        let cur = *config.read().unwrap();
+        if cur.max_width != applied_cfg.max_width
+            || cur.max_height != applied_cfg.max_height
+            || cur.fps != applied_cfg.fps
+        {
+            applied_cfg = cur;
+            let (new_w, new_h) = fit_dimensions(src_w, src_h, cur.max_width, cur.max_height);
+            let new_sc_cfg = SCStreamConfiguration::new()
+                .with_width(new_w as usize)
+                .with_height(new_h as usize)
+                .with_fps(cur.fps.max(5))
+                .with_pixel_format(PixelFormat::BGRA)
+                .with_shows_cursor(true)
+                .with_queue_depth(4);
+            let _ = stream.update_configuration(&new_sc_cfg);
+
+            // Reemite imediatamente o último frame reescalado caso a tela esteja parada
+            if let Ok(guard) = last_frame_cache.lock()
+                && let Some((old_w, old_h, ref old_rgba)) = *guard
+                && (old_w != new_w || old_h != new_h)
+            {
+                let rescaled =
+                    rescale_rgba_nearest(old_rgba, old_w, old_h, new_w, new_h);
+                let _ = tx.send(Some(CapturedVideoFrame {
+                    width: new_w,
+                    height: new_h,
+                    rgba: Arc::new(rescaled),
+                    seq: next_seq(),
+                }));
+            }
+        }
+    }
+
+    let _ = stream.stop_capture();
+}
+
+#[cfg(target_os = "macos")]
+fn rescale_rgba_nearest(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    let sw = src_w.max(1) as usize;
+    let sh = src_h.max(1) as usize;
+    let dw = dst_w.max(1) as usize;
+    let dh = dst_h.max(1) as usize;
+    let mut out = vec![0u8; dw * dh * 4];
+    for y in 0..dh {
+        let sy = (y * sh) / dh;
+        for x in 0..dw {
+            let sx = (x * sw) / dw;
+            let si = (sy * sw + sx) * 4;
+            let di = (y * dw + x) * 4;
+            if si + 4 <= src.len() {
+                out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn capture_loop_fallback(
     config: Arc<RwLock<LiveCaptureConfig>>,
     running: Arc<AtomicBool>,

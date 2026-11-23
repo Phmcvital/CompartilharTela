@@ -779,8 +779,8 @@ fn capture_loop_macos(
     let (init_w, init_h) = fit_dimensions(src_w, src_h, applied_cfg.max_width, applied_cfg.max_height);
 
     let sc_cfg = SCStreamConfiguration::new()
-        .with_width(init_w as usize)
-        .with_height(init_h as usize)
+        .with_width(init_w)
+        .with_height(init_h)
         .with_fps(applied_cfg.fps.max(5))
         .with_pixel_format(PixelFormat::BGRA)
         .with_shows_cursor(true)
@@ -882,8 +882,8 @@ fn capture_loop_macos(
             applied_cfg = cur;
             let (new_w, new_h) = fit_dimensions(src_w, src_h, cur.max_width, cur.max_height);
             let new_sc_cfg = SCStreamConfiguration::new()
-                .with_width(new_w as usize)
-                .with_height(new_h as usize)
+                .with_width(new_w)
+                .with_height(new_h)
                 .with_fps(cur.fps.max(5))
                 .with_pixel_format(PixelFormat::BGRA)
                 .with_shows_cursor(true)

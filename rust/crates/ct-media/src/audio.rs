@@ -1280,7 +1280,7 @@ mod mac_audio {
     use std::time::Instant;
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use cpal::{FromSample, Sample, SampleFormat, SizedSample, StreamConfig};
+    use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
     use screencapturekit::prelude::*;
     use screencapturekit::shareable_content::{SCRunningApplication, SCShareableContent};
 
@@ -1433,7 +1433,7 @@ mod mac_audio {
         )));
 
         // Tenta iniciar o SCStream de áudio do sistema com exclusão dos apps bloqueados
-        let mut sc_stream_opt: Option<SCStream> = (|| -> Option<SCStream> {
+        let sc_stream_opt: Option<SCStream> = (|| -> Option<SCStream> {
             let content = SCShareableContent::get().ok()?;
             let displays = content.displays();
             let display = displays.first()?;
@@ -1610,13 +1610,13 @@ mod mac_audio {
 
         let stream_res = match sample_format {
             SampleFormat::F32 => {
-                build_cpal_output_stream::<f32>(&device, &config, channels, out_rate, shared)
+                build_cpal_output_stream::<f32>(&device, config, channels, out_rate, shared)
             }
             SampleFormat::I16 => {
-                build_cpal_output_stream::<i16>(&device, &config, channels, out_rate, shared)
+                build_cpal_output_stream::<i16>(&device, config, channels, out_rate, shared)
             }
             SampleFormat::U16 => {
-                build_cpal_output_stream::<u16>(&device, &config, channels, out_rate, shared)
+                build_cpal_output_stream::<u16>(&device, config, channels, out_rate, shared)
             }
             _ => {
                 tracing::warn!("Formato de saída CoreAudio não suportado: {sample_format:?}");
@@ -1640,11 +1640,11 @@ mod mac_audio {
 
     fn build_cpal_output_stream<T>(
         device: &cpal::Device,
-        config: &StreamConfig,
+        config: StreamConfig,
         out_channels: usize,
         out_rate: u32,
         shared: Arc<PlaybackShared>,
-    ) -> Result<cpal::Stream, cpal::BuildStreamError>
+    ) -> Result<cpal::Stream, cpal::Error>
     where
         T: SizedSample + FromSample<f32>,
     {

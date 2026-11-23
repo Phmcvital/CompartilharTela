@@ -38,5 +38,5 @@ windows = { version = "0.62", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cpal = "0.18"
-screencapturekit = "12.0"
+screencapturekit = { version = "12.0", features = ["macos_14_0"] }
 
